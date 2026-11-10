@@ -1,0 +1,260 @@
+// scramcalc.nv — the arithmetic of SCRAM, RFC 5802 section 3.
+//
+// SCRAM never sends a password.  Both ends derive a chain of keys from it
+// and prove to each other that they could.
+//
+//   SaltedPassword  := Hi(Normalize(password), salt, i)
+//   ClientKey       := HMAC(SaltedPassword, "Client Key")
+//   StoredKey       := H(ClientKey)
+//   ServerKey       := HMAC(SaltedPassword, "Server Key")
+//   ClientSignature := HMAC(StoredKey, AuthMessage)
+//   ClientProof     := ClientKey XOR ClientSignature
+//   ServerSignature := HMAC(ServerKey, AuthMessage)
+//
+// `Hi` is PBKDF2 (RFC 8018) with HMAC as the pseudorandom function, run for
+// the iteration count the server announced, and `H` and `HMAC` are the
+// mechanism's hash: SHA-1 for SCRAM-SHA-1 and SHA-256 for SCRAM-SHA-256.  A
+// server keeps `StoredKey` and `ServerKey` and never the password.  Given
+// those two and the proof, it recovers `ClientKey` and checks that its hash
+// is `StoredKey`.
+//
+// This module holds the arithmetic and the stored credential.  The messages
+// are in `scramwire`, and the two state machines in `scramclient` and
+// `scramserver`.
+
+use std.bytes
+use std.str
+use std.list
+use hashing
+use digest
+use pbkdf2params
+use pbkdf2kdf
+use scramerr
+
+// The two mechanisms this package runs.
+pub enum ScramMech
+    // SCRAM-SHA-1, RFC 5802.  Hash and key length 20 bytes.
+    ScramSha1
+    // SCRAM-SHA-256, RFC 7677.  Hash and key length 32 bytes.
+    ScramSha256
+
+// How a password is prepared before it is salted.
+//
+// RFC 5802 section 5.1 requires SASLprep (RFC 4013), which maps and
+// normalizes Unicode.  Its tables are not implemented here.
+pub enum ScramPrep
+    // ASCII only.  A password with a byte beyond ASCII is `ScramNonAscii`,
+    // and one with a control character is `ScramPasswordProhibited`, as
+    // SASLprep prohibits.  For an ASCII password this is exactly SASLprep.
+    ScramPrepStrict
+    // The bytes as given, with no check.  What PostgreSQL does when it
+    // cannot prepare a password.  A password that SASLprep would have
+    // rewritten gives different keys from a peer that did rewrite it.
+    ScramPrepVerbatim
+
+// The iteration counts a client accepts from a server.
+//
+// The count comes from the server, so a hostile server can ask for one that
+// makes the client compute for hours, and a careless one can ask for one so
+// small that the password is cheap to guess.
+pub struct ScramLimits
+    min_iterations: Int
+    max_iterations: Int
+
+// The limits a client uses unless told otherwise: 4096, the least RFC 5802
+// section 5.1 says a server should announce, to 10 million.
+pub fn default_limits() -> ScramLimits []
+    ScramLimits { min_iterations: 4096, max_iterations: 10000000 }
+
+// The mechanism's name on the wire: "SCRAM-SHA-1" or "SCRAM-SHA-256".
+pub fn mech_name(m: ScramMech) -> Str []
+    match m
+        ScramSha1   => "SCRAM-SHA-1"
+        ScramSha256 => "SCRAM-SHA-256"
+
+// The mechanism a name stands for.
+//
+// A name ending in "-PLUS" is `ScramChannelBindingUnsupported`, and any
+// other name is `ScramUnsupportedMechanism`.
+pub fn mech_of_name(name: Str) -> Result<ScramMech, ScramError> []
+    if name == "SCRAM-SHA-1"
+        Ok(ScramSha1)
+    else if name == "SCRAM-SHA-256"
+        Ok(ScramSha256)
+    else if name == "SCRAM-SHA-1-PLUS" or name == "SCRAM-SHA-256-PLUS"
+        Err(ScramChannelBindingUnsupported)
+    else
+        Err(ScramUnsupportedMechanism(name))
+
+// The strongest mechanism in a server's list that this package runs.
+//
+// SCRAM-SHA-256 over SCRAM-SHA-1.  The "-PLUS" names and names of other
+// mechanisms are passed over.  `ScramNoCommonMechanism` when none is left.
+pub fn choose_mechanism(offered: [Str]) -> Result<ScramMech, ScramError> []
+    if list.contains(offered, "SCRAM-SHA-256")
+        Ok(ScramSha256)
+    else if list.contains(offered, "SCRAM-SHA-1")
+        Ok(ScramSha1)
+    else
+        Err(ScramNoCommonMechanism)
+
+// The length in bytes of the mechanism's hash, of every key and of a proof.
+pub fn hash_len(m: ScramMech) -> Int []
+    match m
+        ScramSha1   => 20
+        ScramSha256 => 32
+
+// The password as the bytes that are salted.
+//
+// See `ScramPrep` for the two rules.
+pub fn normalize(password: Str, prep: ScramPrep) -> Result<Bytes, ScramError> []
+    match prep
+        ScramPrepVerbatim => Ok(bytes.from_str(password))
+        ScramPrepStrict   => strict(password)
+
+fn strict(password: Str) -> Result<Bytes, ScramError>
+    for i in 0..str.len(password)
+        let b = str.byte_at_or(password, i, 0)
+        if b >= 128
+            return Err(ScramNonAscii)
+        if b < 32 or b == 127
+            return Err(ScramPasswordProhibited)
+    Ok(bytes.from_str(password))
+
+// A positive decimal number without leading zeros and of at most nine
+// digits, or nothing.  RFC 5802's `posit-number`.
+pub fn positive_number(text: Str) -> ?Int []
+    let n = str.len(text)
+    if n == 0 or n > 9 or str.byte_at_or(text, 0, 0) == 48
+        return None
+    for i in 0..n
+        let b = str.byte_at_or(text, i, 0)
+        if b < 48 or b > 57
+            return None
+    str.to_int(text)
+
+// HMAC under the mechanism's hash.
+pub fn hmac(m: ScramMech, key: Bytes, data: Bytes) -> Bytes []
+    match m
+        ScramSha1   => hashing.hmac_sha1(key, data, bytes.zeros(20))
+        ScramSha256 => hashing.hmac_sha256(key, data, bytes.zeros(32))
+
+// The mechanism's hash of `data`.
+pub fn hash(m: ScramMech, data: Bytes) -> Bytes []
+    match m
+        ScramSha1   => hashing.sha1(data)
+        ScramSha256 => hashing.sha256(data)
+
+// `Hi(password, salt, iterations)`: PBKDF2 with the mechanism's HMAC and an
+// output of one hash length.
+//
+// `password` is the prepared bytes of `normalize`.  The iteration count
+// below the floor pbkdf2-nv asks of a password store is accepted here,
+// since SCRAM's count is the server's to announce and 4096 is the figure
+// RFC 5802 names.  Refuses `ScramIterationsOutOfRange` for a count that is
+// not positive.
+pub fn salted_password(m: ScramMech, password: Bytes, salt: Bytes,
+                       iterations: Int) -> Result<Bytes, ScramError> []
+    let prf = match m
+        ScramSha1   => Pbkdf2HmacSha1
+        ScramSha256 => Pbkdf2HmacSha256
+    match pbkdf2params.allowing_below_floor(prf, iterations, hash_len(m))
+        Err(_) => Err(ScramIterationsOutOfRange(iterations, 1, iterations))
+        Ok(p)  =>
+            match pbkdf2kdf.derive(p, password, salt)
+                // cov: skip — the parameters just passed pbkdf2's own check, and `derive` refuses nothing else
+                Err(_)  => Err(ScramIterationsOutOfRange(iterations, 1, iterations))
+                Ok(key) => Ok(key)
+
+// `ClientKey := HMAC(SaltedPassword, "Client Key")`.
+pub fn client_key(m: ScramMech, salted: Bytes) -> Bytes []
+    hmac(m, salted, bytes.from_str("Client Key"))
+
+// `ServerKey := HMAC(SaltedPassword, "Server Key")`.
+pub fn server_key(m: ScramMech, salted: Bytes) -> Bytes []
+    hmac(m, salted, bytes.from_str("Server Key"))
+
+// `StoredKey := H(ClientKey)`.
+pub fn stored_key(m: ScramMech, client_key: Bytes) -> Bytes []
+    hash(m, client_key)
+
+// `a XOR b`, for two byte strings of one length.
+pub fn xor_bytes(a: Bytes, b: Bytes) -> Bytes []
+    let n = bytes.len(a)
+    var out = bytes.zeros(n)
+    for i in 0..n
+        bytes.set_u8(out, i, (bytes.byte_at(a, i) ?? 0) ^ (bytes.byte_at(b, i) ?? 0))
+    out
+
+// `ClientProof := ClientKey XOR HMAC(StoredKey, AuthMessage)`.
+pub fn client_proof(m: ScramMech, client_key: Bytes, auth_message: Bytes) -> Bytes []
+    xor_bytes(client_key, hmac(m, stored_key(m, client_key), auth_message))
+
+// `ServerSignature := HMAC(ServerKey, AuthMessage)`.
+pub fn server_signature(m: ScramMech, server_key: Bytes, auth_message: Bytes) -> Bytes []
+    hmac(m, server_key, auth_message)
+
+// Whether two byte strings are equal, compared in constant time.
+pub fn same_bytes(a: Bytes, b: Bytes) -> Bool []
+    digest.ct_eq(a, b)
+
+// What a server keeps for one user instead of the password.
+//
+// `stored_key` and `server_key` are enough to check a proof and to sign for
+// the server, and not enough to compute a proof.  An attacker who reads them
+// can pose as the server to that user's client and can guess passwords
+// offline, at the cost of `iterations` rounds a guess.
+pub struct ScramStored
+    mech: ScramMech
+    salt: Bytes
+    iterations: Int
+    stored_key: Bytes
+    server_key: Bytes
+
+// The credential a server stores for `password`.
+//
+// `salt` is random bytes the caller draws, 16 or more, new for each user.
+// `iterations` is the work factor, at least 4096 and today more.  Refuses
+// what `normalize` and `salted_password` refuse, and `ScramBadSalt` for an
+// empty salt.
+pub fn stored_from_password(m: ScramMech, password: Str, prep: ScramPrep, salt: Bytes,
+                            iterations: Int) -> Result<ScramStored, ScramError> []
+    if bytes.len(salt) == 0
+        return Err(ScramBadSalt)
+    let prepared = normalize(password, prep)!
+    let salted = salted_password(m, prepared, salt, iterations)!
+    let ck = client_key(m, salted)
+    Ok(ScramStored { mech: m, salt: salt, iterations: iterations, stored_key: stored_key(m, ck),
+                     server_key: server_key(m, salted) })
+
+// The credential in the text form RFC 5803 gives it, which PostgreSQL also
+// stores: `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, the three
+// binary values in base64.
+pub fn stored_to_text(s: ScramStored) -> Str []
+    "${mech_name(s.mech)}\$${s.iterations}:${bytes.to_base64(s.salt)}\$${bytes.to_base64(s.stored_key)}:${bytes.to_base64(s.server_key)}"
+
+// A credential read from its text form.
+//
+// Refuses `ScramBadStored` for anything that is not three parts, two keys
+// of the mechanism's hash length and a positive iteration count, and the
+// mechanism refusals of `mech_of_name`.
+pub fn stored_from_text(text: Str) -> Result<ScramStored, ScramError> []
+    let parts = str.split(text, "\$")
+    if list.len(parts) != 3
+        return Err(ScramBadStored("expected mechanism\$iterations:salt\$stored:server"))
+    let m = mech_of_name(parts[0])!
+    let info = str.split(parts[1], ":")
+    let keys = str.split(parts[2], ":")
+    if list.len(info) != 2 or list.len(keys) != 2
+        return Err(ScramBadStored("expected iterations:salt and stored:server"))
+    let iterations = positive_number(info[0]) ?? 0
+    if iterations == 0
+        return Err(ScramBadStored("the iteration count is not a positive number"))
+    let salt = bytes.from_base64(info[1]) ?? bytes.zeros(0)
+    if bytes.len(salt) == 0
+        return Err(ScramBadStored("the salt is empty or not base64"))
+    let sk = bytes.from_base64(keys[0]) ?? bytes.zeros(0)
+    let vk = bytes.from_base64(keys[1]) ?? bytes.zeros(0)
+    if bytes.len(sk) != hash_len(m) or bytes.len(vk) != hash_len(m)
+        return Err(ScramBadStored("a key is not the length of the hash"))
+    Ok(ScramStored { mech: m, salt: salt, iterations: iterations, stored_key: sk, server_key: vk })

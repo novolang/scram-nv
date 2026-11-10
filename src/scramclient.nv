@@ -1,0 +1,133 @@
+// scramclient.nv — the client of a SCRAM exchange, as three steps.
+//
+// The caller owns the connection and the randomness.  Each step takes what
+// arrived and answers the bytes to send with the state for the next step:
+//
+//   client_first    starts the exchange and answers the client-first message
+//   client_final    reads the server-first message and answers the proof
+//   client_finish   reads the server-final message and checks the server
+//
+// Each state is a value of its own type, so a step cannot be called out of
+// order, and a state is only an argument, so a retry starts from
+// `client_first` with a new nonce.
+//
+// The client nonce is the caller's: 18 or more random bytes from a
+// cryptographically secure generator, written as printable ASCII, for
+// example base64.  A nonce that repeats lets a recorded exchange be
+// replayed.
+//
+// The password is prepared as `ScramPrep` says and is held, as prepared
+// bytes, for as long as the first state lives.  The server's iteration count
+// is checked against the `ScramLimits` given.
+
+use std.bytes
+use std.str
+use scramerr
+use scramcalc
+use scramwire
+
+// The client after its first message, waiting for the server's.
+pub struct ScramClientWaiting
+    mech: ScramMech
+    password: Bytes
+    nonce: Str
+    header: Str
+    bare: Str
+    limits: ScramLimits
+
+// The client after its proof, waiting for the server's signature.
+pub struct ScramClientAwaiting
+    mech: ScramMech
+    server_signature: Bytes
+
+// A message to send and the state to continue from.
+pub struct ScramClientHello
+    message: Bytes
+    state: ScramClientWaiting
+
+// The proof message to send and the state to continue from.
+pub struct ScramClientProof
+    message: Bytes
+    state: ScramClientAwaiting
+
+// Start an exchange: the client-first message.
+//
+// `username` is sent as given, escaped, and must not be empty.  `authzid` is
+// the identity to act as, when it differs.  `nonce` is the client nonce.
+// Refuses `ScramBadUsername`, `ScramBadNonce` and the refusals of
+// `scramcalc.normalize`.
+//
+// ```novo
+// use std.bytes
+// use scramclient
+// use scramcalc
+//
+// fn main() [io]
+//     match scramclient.client_first(ScramSha256, "user", "pencil", ScramPrepStrict, "rOprNGfwEbeRWgbNEkqO", None, scramcalc.default_limits())
+//         Ok(hello) => println(bytes.to_str(hello.message))   // n,,n=user,r=rOprNGfwEbeRWgbNEkqO
+//         Err(e)    => println(e.message())
+// ```
+pub fn client_first(m: ScramMech, username: Str, password: Str, prep: ScramPrep, nonce: Str,
+                    authzid: ?Str, limits: ScramLimits) -> Result<ScramClientHello, ScramError> []
+    if str.len(username) == 0
+        return Err(ScramBadUsername)
+    if not scramwire.printable_nonce(nonce)
+        return Err(ScramBadNonce)
+    let prepared = scramcalc.normalize(password, prep)!
+    let header = scramwire.gs2_header(authzid)
+    let bare = "n=" + scramwire.escape_name(username) + ",r=" + nonce
+    Ok(ScramClientHello { message: bytes.from_str(header + bare),
+                          state: ScramClientWaiting { mech: m, password: prepared, nonce: nonce, header: header,
+                                                      bare: bare, limits: limits } })
+
+// Read the server-first message and answer the client-final message.
+//
+// The nonce must extend the client's, and the iteration count must be inside
+// the limits.  The proof is computed from the salted password and the
+// authentication message, which is the client-first bare message, the
+// server-first message and the client-final message without its proof,
+// joined by commas.  Refuses `ScramMandatoryExtension`, `ScramBadNonce`,
+// `ScramNonceMismatch`, `ScramBadSalt`, `ScramIterationsOutOfRange` and
+// `ScramBadMessage`; a server that answers `e=` instead gives
+// `ScramServerError`.
+pub fn client_final(w: ScramClientWaiting,
+                    server_first: Bytes) -> Result<ScramClientProof, ScramError> []
+    let text = bytes.to_str(server_first)
+    match scramwire.value_of(text, "e")
+        Some(why) =>
+            return Err(ScramServerError(why))
+        None      => 0
+    let parts = scramwire.parse_server_first(text)!
+    if not str.starts_with(parts.nonce, w.nonce) or str.len(parts.nonce) <= str.len(w.nonce)
+        return Err(ScramNonceMismatch)
+    if parts.iterations < w.limits.min_iterations or parts.iterations > w.limits.max_iterations
+        return Err(ScramIterationsOutOfRange(parts.iterations, w.limits.min_iterations, w.limits.max_iterations))
+    let salted = scramcalc.salted_password(w.mech, w.password, parts.salt, parts.iterations)!
+    let channel = "c=" + bytes.to_base64(bytes.from_str(w.header)) + ",r=" + parts.nonce
+    let auth_message = bytes.from_str(w.bare + "," + text + "," + channel)
+    let ck = scramcalc.client_key(w.mech, salted)
+    let proof = scramcalc.client_proof(w.mech, ck, auth_message)
+    let expected = scramcalc.server_signature(w.mech, scramcalc.server_key(w.mech, salted), auth_message)
+    Ok(ScramClientProof { message: bytes.from_str(channel + ",p=" + bytes.to_base64(proof)),
+                          state: ScramClientAwaiting { mech: w.mech, server_signature: expected } })
+
+// Read the server-final message and check the server.
+//
+// `v=` must carry the signature only a server that holds the user's
+// credentials can compute, compared in constant time.  Refuses
+// `ScramServerError` for an `e=`, `ScramServerSignatureMismatch` for a
+// wrong signature and `ScramBadMessage` for neither.
+pub fn client_finish(a: ScramClientAwaiting, server_final: Bytes) -> Result<Unit, ScramError> []
+    let fields = str.split(bytes.to_str(server_final), ",")
+    match scramwire.value_of(fields[0], "e")
+        Some(why) =>
+            return Err(ScramServerError(why))
+        None      => 0
+    match scramwire.value_of(fields[0], "v")
+        None    => Err(ScramBadMessage("the server-final message is v=<signature> or e=<error>"))
+        Some(v) =>
+            let signature = bytes.from_base64(v) ?? bytes.zeros(0)
+            if scramcalc.same_bytes(signature, a.server_signature)
+                Ok(())
+            else
+                Err(ScramServerSignatureMismatch)

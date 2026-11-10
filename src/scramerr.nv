@@ -1,0 +1,77 @@
+// scramerr.nv — why a SCRAM or PLAIN step was refused.
+//
+// Every variant is a fault of a message, of an argument or of a peer.
+// `ScramProofMismatch` and `ScramServerSignatureMismatch` carry nothing
+// on purpose: a proof that does not verify is told apart from every other
+// fault and nothing about how it differs.
+
+// Why a step of an authentication exchange could not be completed.
+pub enum ScramError
+    // A message that is not in the grammar of RFC 5802 section 7.  `what`
+    // names the attribute or the position.
+    ScramBadMessage(what: Str)
+    // A nonce that is empty or holds a character outside printable ASCII
+    // other than a comma (RFC 5802 section 7, `printable`).
+    ScramBadNonce
+    // The server's nonce does not begin with the client's, or adds
+    // nothing to it (section 5.1).
+    ScramNonceMismatch
+    // A salt that is not base64 or is empty.
+    ScramBadSalt
+    // An iteration count outside the client's limits.  `count` is what the
+    // server announced.
+    ScramIterationsOutOfRange(count: Int, least: Int, most: Int)
+    // A user name that is empty.
+    ScramBadUsername
+    // A password with a control character, which SASLprep (RFC 4013
+    // section 2.3) prohibits.
+    ScramPasswordProhibited
+    // A password with a byte beyond ASCII under the strict preparation:
+    // SASLprep's normalization is not implemented.
+    ScramNonAscii
+    // A mechanism name this package does not run.
+    ScramUnsupportedMechanism(name: Str)
+    // The "-PLUS" mechanisms and the "p=" channel-binding flag: channel
+    // binding is not implemented.
+    ScramChannelBindingUnsupported
+    // The server offered nothing this package can run.
+    ScramNoCommonMechanism
+    // A mandatory extension (`m=`) the peer sent, which RFC 5802 requires
+    // a receiver that does not understand it to refuse.
+    ScramMandatoryExtension
+    // The server ended the exchange with an `e=` attribute.  `value` is
+    // the server-error-value.
+    ScramServerError(value: Str)
+    // The server's signature did not verify: the server does not hold the
+    // user's credentials.
+    ScramServerSignatureMismatch
+    // The client's proof did not verify.
+    ScramProofMismatch
+    // A stored credential in its text form that does not parse.
+    ScramBadStored(what: Str)
+    // A SASL PLAIN message that is not authzid, NUL, authcid, NUL,
+    // password, or an argument with a NUL in it.
+    PlainMalformed(what: Str)
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.
+impl Error for ScramError
+    fn message(self) -> Str
+        match self
+            ScramBadMessage(what)                         => "scram: malformed message: ${what}"
+            ScramBadNonce                                 => "scram: a nonce is non-empty printable ASCII without a comma"
+            ScramNonceMismatch                            => "scram: the combined nonce does not extend the client's nonce"
+            ScramBadSalt                                  => "scram: the salt is empty or not base64"
+            ScramIterationsOutOfRange(count, least, most) => "scram: the iteration count ${count} is outside ${least} to ${most}"
+            ScramBadUsername                              => "scram: the user name is empty"
+            ScramPasswordProhibited                       => "scram: the password has a control character"
+            ScramNonAscii                                 => "scram: the password is not ASCII and SASLprep normalization is not implemented"
+            ScramUnsupportedMechanism(name)               => "scram: mechanism ${name} is not implemented"
+            ScramChannelBindingUnsupported                => "scram: channel binding is not implemented"
+            ScramNoCommonMechanism                        => "scram: the server offers no mechanism this client runs"
+            ScramMandatoryExtension                       => "scram: a mandatory extension is present"
+            ScramServerError(value)                       => "scram: the server refused: ${value}"
+            ScramServerSignatureMismatch                  => "scram: the server's signature did not verify"
+            ScramProofMismatch                            => "scram: the client's proof did not verify"
+            ScramBadStored(what)                          => "scram: malformed stored credential: ${what}"
+            PlainMalformed(what)                          => "plain: malformed message: ${what}"

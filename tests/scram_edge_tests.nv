@@ -1,0 +1,355 @@
+// scram_edge_tests.nv — what SCRAM refuses.
+//
+// The vectors say what an honest exchange computes.  These cases are the
+// dishonest and the careless: a server that answers `e=`, one that does
+// not extend the nonce, an iteration count a hostile server picks, a proof
+// from the wrong password, a name with an equals sign, a password with a
+// control character, the mechanisms the package does not run.
+
+use std.test
+use std.bytes
+use std.str
+use scramerr
+use scramcalc
+use scramwire
+use scramclient
+use scramserver
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn w(s: Str) -> Bytes
+    bytes.from_str(s)
+
+fn said<T>(r: Result<T, ScramError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+fn limits() -> ScramLimits
+    ScramLimits { min_iterations: 4096, max_iterations: 10000 }
+
+fn start(password: Str) -> ScramClientWaiting
+    let hello = scramclient.client_first(ScramSha256, "user", password, ScramPrepStrict, "abcdef", None, limits())!
+    hello.state
+
+fn server_first(nonce: Str, salt64: Str, iterations: Str) -> Bytes
+    w("r=${nonce},s=${salt64},i=${iterations}")
+
+fn stored() -> ScramStored
+    scramcalc.stored_from_password(ScramSha256, "pencil", ScramPrepStrict, w("0123456789abcdef"), 4096)!
+
+@test
+fn test_the_mechanisms_are_named_chosen_and_sized() [io]
+    test.assert_eq_str(scramcalc.mech_name(ScramSha1), "SCRAM-SHA-1")
+    test.assert_eq_str(scramcalc.mech_name(ScramSha256), "SCRAM-SHA-256")
+    test.assert_eq(scramcalc.hash_len(ScramSha1), 20)
+    test.assert_eq(scramcalc.hash_len(ScramSha256), 32)
+    test.assert_eq(scramcalc.mech_of_name("SCRAM-SHA-1")!, ScramSha1)
+    test.assert_eq(scramcalc.mech_of_name("SCRAM-SHA-256")!, ScramSha256)
+    test.case("channel binding is named, not run")
+    test.assert_eq_str(said(scramcalc.mech_of_name("SCRAM-SHA-256-PLUS")),
+        "scram: channel binding is not implemented")
+    test.assert_eq_str(said(scramcalc.mech_of_name("SCRAM-SHA-1-PLUS")), "scram: channel binding is not implemented")
+    test.assert_eq_str(said(scramcalc.mech_of_name("CRAM-MD5")), "scram: mechanism CRAM-MD5 is not implemented")
+    test.case("the strongest of what the server offers, and not a PLUS name")
+    test.assert_eq(scramcalc.choose_mechanism(["PLAIN", "SCRAM-SHA-1", "SCRAM-SHA-256"])!, ScramSha256)
+    test.assert_eq(scramcalc.choose_mechanism(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-1"])!, ScramSha1)
+    test.assert_eq_str(said(scramcalc.choose_mechanism(["SCRAM-SHA-256-PLUS", "PLAIN"])),
+                       "scram: the server offers no mechanism this client runs")
+    test.assert_eq_str(said(scramcalc.choose_mechanism([])), "scram: the server offers no mechanism this client runs")
+    test.assert_eq(scramcalc.default_limits().min_iterations, 4096)
+    test.assert_eq(scramcalc.default_limits().max_iterations, 10000000)
+
+@test
+fn test_a_password_is_prepared_strictly_or_not_at_all() [io]
+    test.assert_eq_str(bytes.to_hex(scramcalc.normalize("a b~", ScramPrepStrict)!), "6120627e")
+    test.assert_eq_str(said(scramcalc.normalize("caf${str.from_char(233)}", ScramPrepStrict)),
+        "scram: the password is not ASCII and SASLprep normalization is not implemented")
+    test.assert_eq_str(said(scramcalc.normalize("a${str.from_byte(1)}b", ScramPrepStrict)),
+        "scram: the password has a control character")
+    test.assert_eq_str(said(scramcalc.normalize("a${str.from_byte(127)}", ScramPrepStrict)),
+        "scram: the password has a control character")
+    test.assert_eq_str(said(scramcalc.normalize("", ScramPrepStrict)), "ok")
+    test.case("verbatim hands over the bytes as typed")
+    test.assert_eq_str(bytes.to_hex(scramcalc.normalize("caf${str.from_char(233)}${str.from_byte(1)}", ScramPrepVerbatim)!),
+        "636166c3a901")
+
+@test
+fn test_a_positive_number_is_digits_without_a_leading_zero() [io]
+    test.assert_eq(scramcalc.positive_number("4096"), Some(4096))
+    test.assert_eq(scramcalc.positive_number("1"), Some(1))
+    test.assert_eq(scramcalc.positive_number("999999999"), Some(999999999))
+    test.assert_eq(scramcalc.positive_number(""), None)
+    test.assert_eq(scramcalc.positive_number("0"), None)
+    test.assert_eq(scramcalc.positive_number("04096"), None)
+    test.assert_eq(scramcalc.positive_number("-5"), None)
+    test.assert_eq(scramcalc.positive_number("+5"), None)
+    test.assert_eq(scramcalc.positive_number("12a"), None)
+    test.assert_eq(scramcalc.positive_number("9999999999"), None)
+
+@test
+fn test_the_key_chain_has_the_lengths_of_the_hash() [io]
+    for m in [ScramSha1, ScramSha256]
+        let n = scramcalc.hash_len(m)
+        let salted = scramcalc.salted_password(m, w("pencil"), w("saltsalt"), 2)!
+        test.assert_eq(bytes.len(salted), n)
+        let ck = scramcalc.client_key(m, salted)
+        test.assert_eq(bytes.len(ck), n)
+        test.assert_eq(bytes.len(scramcalc.stored_key(m, ck)), n)
+        test.assert_eq(bytes.len(scramcalc.server_key(m, salted)), n)
+        test.assert_eq(bytes.len(scramcalc.hash(m, w("x"))), n)
+        test.assert_eq(bytes.len(scramcalc.hmac(m, w("k"), w("x"))), n)
+        test.assert_eq(bytes.len(scramcalc.client_proof(m, ck, w("auth"))), n)
+        test.assert_eq(bytes.len(scramcalc.server_signature(m, ck, w("auth"))), n)
+    test.assert_eq_str(bytes.to_hex(scramcalc.xor_bytes(h("ff00aa"), h("0ff0aa"))), "f0f000")
+    test.assert_eq(scramcalc.same_bytes(h("0102"), h("0102")), true)
+    test.assert_eq(scramcalc.same_bytes(h("0102"), h("0103")), false)
+    test.assert_eq(scramcalc.same_bytes(h("0102"), h("010203")), false)
+    test.case("a count that is not positive")
+    test.assert_eq_str(said(scramcalc.salted_password(ScramSha1, w("p"), w("saltsalt"), 0)),
+        "scram: the iteration count 0 is outside 1 to 0")
+
+@test
+fn test_a_stored_credential_is_written_and_read_back() [io]
+    let s = stored()
+    let text = scramcalc.stored_to_text(s)
+    test.assert_eq_str(text,
+        "SCRAM-SHA-256\$4096:MDEyMzQ1Njc4OWFiY2RlZg==\$" + bytes.to_base64(s.stored_key) + ":" + bytes.to_base64(s.server_key))
+    let back = scramcalc.stored_from_text(text)!
+    test.assert_eq(back.mech, ScramSha256)
+    test.assert_eq(back.iterations, 4096)
+    test.assert_eq_str(bytes.to_hex(back.salt), bytes.to_hex(s.salt))
+    test.assert_eq_str(bytes.to_hex(back.stored_key), bytes.to_hex(s.stored_key))
+    test.assert_eq_str(bytes.to_hex(back.server_key), bytes.to_hex(s.server_key))
+    test.case("an empty salt is refused when the credential is made")
+    test.assert_eq_str(said(scramcalc.stored_from_password(ScramSha256, "p", ScramPrepStrict, bytes.zeros(0), 4096)),
+        "scram: the salt is empty or not base64")
+    test.assert_eq_str(said(scramcalc.stored_from_password(ScramSha256, "p${str.from_byte(1)}", ScramPrepStrict, w("saltsalt"), 4096)),
+        "scram: the password has a control character")
+    test.assert_eq_str(said(scramcalc.stored_from_password(ScramSha256, "p", ScramPrepStrict, w("saltsalt"), 0)),
+        "scram: the iteration count 0 is outside 1 to 0")
+
+@test
+fn test_a_stored_credential_that_does_not_parse_is_refused() [io]
+    let key32 = bytes.to_base64(bytes.zeros(32))
+    let key20 = bytes.to_base64(bytes.zeros(20))
+    let salt = bytes.to_base64(w("saltsalt"))
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$4096:${salt}")),
+        "scram: malformed stored credential: expected mechanism\$iterations:salt\$stored:server")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-512\$4096:${salt}\$${key32}:${key32}")),
+        "scram: mechanism SCRAM-SHA-512 is not implemented")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$4096\$${key32}:${key32}")),
+        "scram: malformed stored credential: expected iterations:salt and stored:server")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$4096:${salt}\$${key32}")),
+        "scram: malformed stored credential: expected iterations:salt and stored:server")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$0:${salt}\$${key32}:${key32}")),
+        "scram: malformed stored credential: the iteration count is not a positive number")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$4096:!!!\$${key32}:${key32}")),
+        "scram: malformed stored credential: the salt is empty or not base64")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$4096:${salt}\$${key20}:${key32}")),
+        "scram: malformed stored credential: a key is not the length of the hash")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-256\$4096:${salt}\$${key32}:${key20}")),
+        "scram: malformed stored credential: a key is not the length of the hash")
+    test.assert_eq_str(said(scramcalc.stored_from_text("SCRAM-SHA-1\$4096:${salt}\$${key20}:${key20}")), "ok")
+
+@test
+fn test_names_are_escaped_and_nonces_are_printable() [io]
+    test.assert_eq_str(scramwire.escape_name("a,b=c"), "a=2Cb=3Dc")
+    test.assert_eq_str(scramwire.escape_name("plain"), "plain")
+    test.assert_eq_str(scramwire.unescape_name("a=2Cb=3Dc")!, "a,b=c")
+    test.assert_eq_str(scramwire.unescape_name("=3D=3D")!, "==")
+    test.assert_eq_str(said(scramwire.unescape_name("a=b")),
+        "scram: malformed message: a name has \"=\" only as =2C or =3D")
+    test.assert_eq_str(said(scramwire.unescape_name("a=2c")),
+        "scram: malformed message: a name has \"=\" only as =2C or =3D")
+    test.assert_eq(scramwire.printable_nonce("rOprNGfw+/=%)\$k0"), true)
+    test.assert_eq(scramwire.printable_nonce(""), false)
+    test.assert_eq(scramwire.printable_nonce("a,b"), false)
+    test.assert_eq(scramwire.printable_nonce("a b"), false)
+    test.assert_eq(scramwire.printable_nonce("caf${str.from_char(233)}"), false)
+    test.assert_eq(scramwire.printable_nonce("a${str.from_byte(127)}"), false)
+    test.assert_eq(scramwire.value_of("r=abc", "r"), Some("abc"))
+    test.assert_eq(scramwire.value_of("r=abc", "s"), None)
+    test.assert_eq_str(scramwire.gs2_header(None), "n,,")
+    test.assert_eq_str(scramwire.gs2_header(Some("a,b")), "n,a=a=2Cb,")
+
+@test
+fn test_a_client_first_message_that_is_not_one_is_refused() [io]
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,n=user")),
+        "scram: malformed message: a client-first message has a header, a user and a nonce")
+    test.assert_eq_str(said(scramwire.parse_client_first("p=tls-unique,,n=user,r=abc")),
+        "scram: channel binding is not implemented")
+    test.assert_eq_str(said(scramwire.parse_client_first("x,,n=user,r=abc")),
+        "scram: malformed message: the channel-binding flag is n, y or p=")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,b=x,n=user,r=abc")),
+        "scram: malformed message: the authorization identity is a=<name>")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,a=x=,n=user,r=abc")),
+        "scram: malformed message: a name has \"=\" only as =2C or =3D")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,m=ext,n=user,r=abc")),
+        "scram: a mandatory extension is present")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,u=user,r=abc")),
+        "scram: malformed message: the user is n=<name>")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,n=user,x=abc")),
+        "scram: malformed message: the nonce is r=<nonce>")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,n=,r=abc")), "scram: the user name is empty")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,n=user,r=")),
+        "scram: a nonce is non-empty printable ASCII without a comma")
+    test.assert_eq_str(said(scramwire.parse_client_first("n,,n=us=er,r=abc")),
+        "scram: malformed message: a name has \"=\" only as =2C or =3D")
+    test.case("the flag y is accepted, and extensions after the nonce are kept in the bare message")
+    let p = scramwire.parse_client_first("y,a=root,n=u=2Cv,r=abc,x=1")!
+    test.assert_eq_str(p.header, "y,a=root,")
+    test.assert_eq(p.authzid, Some("root"))
+    test.assert_eq_str(p.username, "u,v")
+    test.assert_eq_str(p.nonce, "abc")
+    test.assert_eq_str(p.bare, "n=u=2Cv,r=abc,x=1")
+
+@test
+fn test_a_server_first_message_that_is_not_one_is_refused() [io]
+    test.assert_eq_str(said(scramwire.parse_server_first("r=abc,s=c2FsdA==")),
+        "scram: malformed message: a server-first message has a nonce, a salt and an iteration count")
+    test.assert_eq_str(said(scramwire.parse_server_first("m=x,r=abc,s=c2FsdA==,i=4096")),
+        "scram: a mandatory extension is present")
+    test.assert_eq_str(said(scramwire.parse_server_first("s=c2FsdA==,r=abc,i=4096")),
+        "scram: malformed message: the fields are r=, s= and i= in that order")
+    test.assert_eq_str(said(scramwire.parse_server_first("r=abc,s=c2FsdA==,n=4096")),
+        "scram: malformed message: the fields are r=, s= and i= in that order")
+    test.assert_eq_str(said(scramwire.parse_server_first("r=a b,s=c2FsdA==,i=4096")),
+        "scram: a nonce is non-empty printable ASCII without a comma")
+    test.assert_eq_str(said(scramwire.parse_server_first("r=abc,s=,i=4096")),
+        "scram: the salt is empty or not base64")
+    test.assert_eq_str(said(scramwire.parse_server_first("r=abc,s=!!,i=4096")),
+        "scram: the salt is empty or not base64")
+    test.assert_eq_str(said(scramwire.parse_server_first("r=abc,s=c2FsdA==,i=0")),
+        "scram: malformed message: the iteration count is a positive number")
+    test.assert_eq_str(said(scramwire.parse_server_first("r=abc,s=c2FsdA==,i=4096,x=1")), "ok")
+
+@test
+fn test_a_client_final_message_that_is_not_one_is_refused() [io]
+    test.assert_eq_str(said(scramwire.parse_client_final("c=biws,r=abc")),
+        "scram: malformed message: a client-final message has a channel binding, a nonce and a proof")
+    test.assert_eq_str(said(scramwire.parse_client_final("r=abc,c=biws,p=AAAA")),
+        "scram: malformed message: the fields are c=, r= ... p=")
+    test.assert_eq_str(said(scramwire.parse_client_final("c=biws,r=abc,x=AAAA")),
+        "scram: malformed message: the fields are c=, r= ... p=")
+    test.assert_eq_str(said(scramwire.parse_client_final("c=biws,r=a b,p=AAAA")),
+        "scram: a nonce is non-empty printable ASCII without a comma")
+    test.assert_eq_str(said(scramwire.parse_client_final("c=biws,r=abc,p=")),
+        "scram: malformed message: the proof is empty or not base64")
+    test.assert_eq_str(said(scramwire.parse_client_final("c=biws,r=abc,p=!!")),
+        "scram: malformed message: the proof is empty or not base64")
+    let p = scramwire.parse_client_final("c=biws,r=abc,x=1,p=AAAA")!
+    test.assert_eq_str(p.without_proof, "c=biws,r=abc,x=1")
+    test.assert_eq_str(p.channel, "biws")
+
+@test
+fn test_a_client_refuses_to_start_with_what_it_cannot_send() [io]
+    test.assert_eq_str(said(scramclient.client_first(ScramSha256, "", "pw", ScramPrepStrict, "abc", None, limits())),
+        "scram: the user name is empty")
+    test.assert_eq_str(said(scramclient.client_first(ScramSha256, "u", "pw", ScramPrepStrict, "a,b", None, limits())),
+        "scram: a nonce is non-empty printable ASCII without a comma")
+    test.assert_eq_str(said(scramclient.client_first(ScramSha256, "u", "caf${str.from_char(233)}", ScramPrepStrict, "abc", None, limits())),
+                       "scram: the password is not ASCII and SASLprep normalization is not implemented")
+    test.assert_eq_str(said(scramclient.client_first(ScramSha256, "u", "caf${str.from_char(233)}", ScramPrepVerbatim, "abc", None, limits())),
+        "ok")
+    test.assert_eq_str(bytes.to_str(scramclient.client_first(ScramSha1, "a=b,c", "pw", ScramPrepStrict, "abc", Some("x,y"), limits())!.message),
+                       "n,a=x=2Cy,n=a=3Db=2Cc,r=abc")
+
+@test
+fn test_a_client_refuses_a_server_first_message_it_should_not_trust() [io]
+    let w0 = start("pencil")
+    let salt = bytes.to_base64(w("saltsalt"))
+    test.case("the server ended the exchange")
+    test.assert_eq_str(said(scramclient.client_final(w0, w("e=unknown-user"))),
+        "scram: the server refused: unknown-user")
+    test.case("a nonce that is not the client's, or is only the client's")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("zzzzzzzzz", salt, "4096"))),
+        "scram: the combined nonce does not extend the client's nonce")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("abcdef", salt, "4096"))),
+        "scram: the combined nonce does not extend the client's nonce")
+    test.case("iteration counts outside the limits, on either side of each")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("abcdefXY", salt, "4095"))),
+        "scram: the iteration count 4095 is outside 4096 to 10000")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("abcdefXY", salt, "10001"))),
+        "scram: the iteration count 10001 is outside 4096 to 10000")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("abcdefXY", salt, "4096"))), "ok")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("abcdefXY", salt, "10000"))), "ok")
+    test.case("a malformed message")
+    test.assert_eq_str(said(scramclient.client_final(w0, w("hello"))),
+        "scram: malformed message: a server-first message has a nonce, a salt and an iteration count")
+    test.assert_eq_str(said(scramclient.client_final(w0, server_first("abcdefXY", "", "4096"))),
+        "scram: the salt is empty or not base64")
+
+@test
+fn test_a_client_checks_the_server_that_answered() [io]
+    let w0 = start("pencil")
+    let salt = bytes.to_base64(w("saltsalt"))
+    let proof = scramclient.client_final(w0, server_first("abcdefXY", salt, "4096"))!
+    test.assert_eq_str(said(scramclient.client_finish(proof.state, w("e=invalid-proof"))),
+        "scram: the server refused: invalid-proof")
+    test.assert_eq_str(said(scramclient.client_finish(proof.state, w("hello"))),
+        "scram: malformed message: the server-final message is v=<signature> or e=<error>")
+    test.assert_eq_str(said(scramclient.client_finish(proof.state, w("v=AAAA"))),
+        "scram: the server's signature did not verify")
+    test.assert_eq_str(said(scramclient.client_finish(proof.state, w("v=!!"))),
+        "scram: the server's signature did not verify")
+    test.case("a server that holds other credentials signs differently")
+    let other = scramcalc.stored_from_password(ScramSha256, "not pencil", ScramPrepStrict, w("saltsalt"), 4096)!
+    let hello = scramserver.server_begin(scramclient.client_first(ScramSha256, "user", "pencil", ScramPrepStrict, "abcdef", None, limits())!.message)!
+    let challenge = scramserver.server_challenge(hello.state, other, "XY")!
+    test.assert_eq_str(said(scramserver.server_verify(challenge.state, proof.message)),
+        "scram: the client's proof did not verify")
+
+@test
+fn test_a_server_refuses_what_it_should_not_trust() [io]
+    test.assert_eq_str(said(scramserver.server_begin(w("p=tls-unique,,n=user,r=abc"))),
+        "scram: channel binding is not implemented")
+    test.assert_eq_str(said(scramserver.server_begin(w("hello"))),
+        "scram: malformed message: a client-first message has a header, a user and a nonce")
+    let hello = scramserver.server_begin(w("n,,n=user,r=abcdef"))!
+    test.assert_eq_str(hello.username, "user")
+    test.assert_eq(hello.authzid, None)
+    test.assert_eq_str(said(scramserver.server_challenge(hello.state, stored(), "")),
+        "scram: a nonce is non-empty printable ASCII without a comma")
+    test.assert_eq_str(said(scramserver.server_challenge(hello.state, stored(), "a,b")),
+        "scram: a nonce is non-empty printable ASCII without a comma")
+    let challenge = scramserver.server_challenge(hello.state, stored(), "XY")!
+    test.assert_eq_str(bytes.to_str(challenge.message), "r=abcdefXY,s=MDEyMzQ1Njc4OWFiY2RlZg==,i=4096")
+    test.case("a final message with another nonce, another channel binding, a proof of the wrong size or the wrong value")
+    test.assert_eq_str(said(scramserver.server_verify(challenge.state, w("c=biws,r=abcdefZZ,p=AAAA"))),
+        "scram: the combined nonce does not extend the client's nonce")
+    test.assert_eq_str(said(scramserver.server_verify(challenge.state, w("c=eSws,r=abcdefXY,p=AAAA"))),
+        "scram: malformed message: the channel binding is not the header the client sent")
+    test.assert_eq_str(said(scramserver.server_verify(challenge.state, w("c=biws,r=abcdefXY,p=AAAA"))),
+        "scram: the client's proof did not verify")
+    test.assert_eq_str(said(scramserver.server_verify(challenge.state, w("hello"))),
+        "scram: malformed message: a client-final message has a channel binding, a nonce and a proof")
+    test.assert_eq_str(said(scramserver.server_verify(challenge.state, w("c=biws,r=abcdefXY,p=" + bytes.to_base64(bytes.zeros(32))))),
+        "scram: the client's proof did not verify")
+
+@test
+fn test_every_failure_has_a_server_error_value() [io]
+    test.assert_eq_str(bytes.to_str(scramserver.server_error_message(ScramProofMismatch)), "e=invalid-proof")
+    test.assert_eq_str(bytes.to_str(scramserver.server_error_message(ScramChannelBindingUnsupported)),
+        "e=channel-binding-not-supported")
+    test.assert_eq_str(bytes.to_str(scramserver.server_error_message(ScramMandatoryExtension)),
+        "e=extensions-not-supported")
+    test.assert_eq_str(bytes.to_str(scramserver.server_error_message(ScramBadUsername)),
+        "e=invalid-username-encoding")
+    test.assert_eq_str(bytes.to_str(scramserver.server_error_message(ScramNonceMismatch)), "e=other-error")
+    test.assert_eq_str(bytes.to_str(scramserver.server_error_message(ScramBadSalt)), "e=invalid-encoding")
+
+@test
+fn test_every_refusal_says_what_it_is() [io]
+    test.assert_eq_str(ScramBadNonce.message(), "scram: a nonce is non-empty printable ASCII without a comma")
+    test.assert_eq_str(ScramUnsupportedMechanism("X").message(), "scram: mechanism X is not implemented")
+    test.assert_eq_str(ScramServerError("e").message(), "scram: the server refused: e")
+    test.assert_eq_str(ScramServerSignatureMismatch.message(), "scram: the server's signature did not verify")
+    test.assert_eq_str(ScramBadStored("x").message(), "scram: malformed stored credential: x")
+    test.assert_eq_str(PlainMalformed("x").message(), "plain: malformed message: x")
+    test.assert_eq_str(ScramNoCommonMechanism.message(), "scram: the server offers no mechanism this client runs")
+    test.assert_eq_str(ScramPasswordProhibited.message(), "scram: the password has a control character")
+    test.assert_eq_str(ScramNonAscii.message(),
+        "scram: the password is not ASCII and SASLprep normalization is not implemented")
+    test.assert_eq_str(ScramIterationsOutOfRange(1, 2, 3).message(), "scram: the iteration count 1 is outside 2 to 3")

@@ -1,0 +1,143 @@
+// scramserver.nv — the server of a SCRAM exchange, as three steps.
+//
+// The server reads the client's first message, finds the stored credential
+// of the user it names, and answers a challenge; it then reads the client's
+// proof and answers the server's signature.
+//
+//   server_begin       reads client-first and answers the user name
+//   server_challenge   takes that user's `ScramStored` and answers server-first
+//   server_verify      reads client-final, checks the proof, answers server-final
+//
+// Between the first and second step the caller looks the user up.  A user
+// who is not known should still get a challenge, from a credential made for
+// the purpose with a salt that depends on the name and a fixed iteration
+// count, so that the answer does not tell a caller which names exist.  The
+// step after the challenge then fails the proof, as it does for a wrong
+// password.
+//
+// The server nonce is the caller's: 18 or more random bytes, printable
+// ASCII.  The server keeps the stored key, never the password.
+
+use std.bytes
+use std.str
+use scramerr
+use scramcalc
+use scramwire
+
+// The server after the client's first message.
+pub struct ScramServerFresh
+    header: Str
+    bare: Str
+    nonce: Str
+
+// What the first message said: the user to look up, the identity the client
+// asks to act as, and the state for `server_challenge`.
+pub struct ScramServerHello
+    username: Str
+    authzid: ?Str
+    state: ScramServerFresh
+
+// The server after its challenge, waiting for the proof.
+pub struct ScramServerWaiting
+    stored: ScramStored
+    header: Str
+    bare: Str
+    server_first: Str
+    nonce: Str
+
+// The challenge to send and the state to continue from.
+pub struct ScramServerChallenge
+    message: Bytes
+    state: ScramServerWaiting
+
+// The server-final message of a successful exchange.
+pub struct ScramServerDone
+    message: Bytes
+
+// Read the client-first message.
+//
+// Refuses what `scramwire.parse_client_first` refuses: `p=` is
+// `ScramChannelBindingUnsupported`.
+pub fn server_begin(client_first: Bytes) -> Result<ScramServerHello, ScramError> []
+    let p = scramwire.parse_client_first(bytes.to_str(client_first))!
+    Ok(ScramServerHello { username: p.username, authzid: p.authzid,
+                          state: ScramServerFresh { header: p.header, bare: p.bare, nonce: p.nonce } })
+
+// Answer the challenge for a user whose credential is `stored`.
+//
+// `server_nonce` is appended to the client's.  Refuses `ScramBadNonce` for
+// one that is empty or not printable.
+//
+// ```novo
+// use std.bytes
+// use std.str
+// use scramserver
+// use scramcalc
+//
+// fn main() [io]
+//     match scramcalc.stored_from_password(ScramSha256, "pencil", ScramPrepStrict, bytes.from_str("0123456789abcdef"), 4096)
+//         Err(e)     => println(e.message())
+//         Ok(stored) =>
+//             match scramserver.server_begin(bytes.from_str("n,,n=user,r=abc123"))
+//                 Err(e)    => println(e.message())
+//                 Ok(hello) =>
+//                     match scramserver.server_challenge(hello.state, stored, "xyz789")
+//                         Ok(c)  => println(str.slice(bytes.to_str(c.message), 0, 14))   // r=abc123xyz789
+//                         Err(e) => println(e.message())
+// ```
+pub fn server_challenge(fresh: ScramServerFresh, stored: ScramStored,
+                        server_nonce: Str) -> Result<ScramServerChallenge, ScramError> []
+    if not scramwire.printable_nonce(server_nonce)
+        return Err(ScramBadNonce)
+    let nonce = fresh.nonce + server_nonce
+    let first = "r=" + nonce + ",s=" + bytes.to_base64(stored.salt) + ",i=" + str.from_int(stored.iterations)
+    Ok(ScramServerChallenge { message: bytes.from_str(first),
+                              state: ScramServerWaiting { stored: stored, header: fresh.header, bare: fresh.bare,
+                                                          server_first: first, nonce: nonce } })
+
+// Read the client-final message, check the proof and answer the
+// server-final message.
+//
+// The channel binding must be the header the client sent, the nonce must be
+// the one the server issued, and the proof must open to a client key whose
+// hash is the stored key, compared in constant time.  Refuses
+// `ScramNonceMismatch`, `ScramBadMessage`, and `ScramProofMismatch` for a
+// proof that does not verify.  After a refusal the caller sends
+// `server_error_message` and ends the exchange.
+pub fn server_verify(w: ScramServerWaiting,
+                     client_final: Bytes) -> Result<ScramServerDone, ScramError> []
+    let p = scramwire.parse_client_final(bytes.to_str(client_final))!
+    if p.nonce != w.nonce
+        return Err(ScramNonceMismatch)
+    if p.channel != bytes.to_base64(bytes.from_str(w.header))
+        return Err(ScramBadMessage("the channel binding is not the header the client sent"))
+    let m = w.stored.mech
+    if bytes.len(p.proof) != scramcalc.hash_len(m)
+        return Err(ScramProofMismatch)
+    let auth_message = bytes.from_str(w.bare + "," + w.server_first + "," + p.without_proof)
+    let signature = scramcalc.hmac(m, w.stored.stored_key, auth_message)
+    let client_key = scramcalc.xor_bytes(p.proof, signature)
+    if not scramcalc.same_bytes(scramcalc.hash(m, client_key), w.stored.stored_key)
+        return Err(ScramProofMismatch)
+    let mine = scramcalc.server_signature(m, w.stored.server_key, auth_message)
+    Ok(ScramServerDone { message: bytes.from_str("v=" + bytes.to_base64(mine)) })
+
+// The server-final message that ends a failed exchange: `e=` and the
+// server-error-value of RFC 5802 section 7 nearest to the refusal.
+//
+// ```novo
+// use std.bytes
+// use scramserver
+//
+// fn main() [io]
+//     println(bytes.to_str(scramserver.server_error_message(ScramProofMismatch)))   // e=invalid-proof
+// ```
+pub fn server_error_message(e: ScramError) -> Bytes []
+    let value = match e
+        ScramProofMismatch             => "invalid-proof"
+        ScramChannelBindingUnsupported => "channel-binding-not-supported"
+        ScramMandatoryExtension        => "extensions-not-supported"
+        ScramBadUsername               => "invalid-username-encoding"
+        ScramNonceMismatch             => "other-error"
+        _                              => "invalid-encoding"
+    bytes.from_str("e=" + value)

@@ -1,0 +1,198 @@
+// scramwire.nv — the messages of SCRAM, RFC 5802 section 7.
+//
+// A SCRAM message is a line of comma-separated attributes, each one a
+// letter, an equals sign and a value.  Four are sent in a successful
+// exchange.
+//
+//   client-first   gs2-header client-first-message-bare
+//                  where the header is a flag, a comma, an optional
+//                  authorization identity and a comma, and the bare
+//                  message is `n=<user>,r=<client nonce>`
+//   server-first   r=<client nonce><server nonce>,s=<salt>,i=<iterations>
+//   client-final   c=<base64 of the header>,r=<nonce>,p=<proof>
+//   server-final   v=<server signature>, or e=<error>
+//
+// This module reads each of them into its parts and writes the pieces a
+// state machine assembles.  A user name travels with "=" written "=3D" and
+// "," written "=2C".  Extensions, attributes after the required ones, are
+// ignored; a mandatory extension, `m=`, is refused.
+
+use std.bytes
+use std.str
+use std.list
+use scramerr
+use scramcalc
+
+// A nonce is non-empty printable ASCII without a comma (RFC 5802
+// section 7: `printable = %x21-2B / %x2D-7E`).
+pub fn printable_nonce(s: Str) -> Bool []
+    if str.len(s) == 0
+        return false
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b < 33 or b > 126 or b == 44
+            return false
+    true
+
+// A user name or authorization identity as it travels: "=" is "=3D" and
+// "," is "=2C".
+//
+// ```novo
+// use scramwire
+//
+// fn main() [io]
+//     println(scramwire.escape_name("a,b=c"))   // a=2Cb=3Dc
+// ```
+pub fn escape_name(name: Str) -> Str []
+    str.replace(str.replace(name, "=", "=3D"), ",", "=2C")
+
+// A name read back from its wire form.
+//
+// An "=" must be followed by "2C" or "3D"; any other use is
+// `ScramBadMessage`.
+pub fn unescape_name(wire: Str) -> Result<Str, ScramError> []
+    let parts = str.split(wire, "=")
+    var out = parts[0]
+    for i in 1..list.len(parts)
+        let p = parts[i]
+        if str.starts_with(p, "2C")
+            out = out + "," + str.slice(p, 2, str.len(p))
+        else if str.starts_with(p, "3D")
+            out = out + "=" + str.slice(p, 2, str.len(p))
+        else
+            return Err(ScramBadMessage("a name has \"=\" only as =2C or =3D"))
+    Ok(out)
+
+// The value of an attribute written `key=value`, or nothing when the field
+// is another attribute.
+pub fn value_of(field: Str, key: Str) -> ?Str []
+    let prefix = key + "="
+    if str.starts_with(field, prefix)
+        Some(str.slice(field, str.len(prefix), str.len(field)))
+    else
+        None
+
+// The GS2 header a client sends: "n,," for no authorization identity and
+// "n,a=<name>," for one.  The flag is always `n`: this package does not
+// implement channel binding.
+pub fn gs2_header(authzid: ?Str) -> Str []
+    match authzid
+        Some(a) => "n,a=" + escape_name(a) + ","
+        None    => "n,,"
+
+// The parts of a client-first message.
+//
+// `header` is the GS2 header with its trailing comma, `bare` is the rest and
+// `nonce` the client's nonce.
+pub struct ScramClientFirstParts
+    header: Str
+    authzid: ?Str
+    username: Str
+    nonce: Str
+    bare: Str
+
+// Read a client-first message.
+//
+// Refuses `ScramChannelBindingUnsupported` for the `p=` flag,
+// `ScramMandatoryExtension` for `m=`, `ScramBadUsername` for an empty name,
+// `ScramBadNonce`, and `ScramBadMessage` for anything outside the grammar.
+// The flags `n` and `y` are accepted: a client that says `y` supports
+// channel binding and believes the server does not, and this server does
+// not.
+pub fn parse_client_first(message: Str) -> Result<ScramClientFirstParts, ScramError> []
+    let fields = str.split(message, ",")
+    if list.len(fields) < 4
+        return Err(ScramBadMessage("a client-first message has a header, a user and a nonce"))
+    let flag = fields[0]
+    if str.starts_with(flag, "p=")
+        return Err(ScramChannelBindingUnsupported)
+    if flag != "n" and flag != "y"
+        return Err(ScramBadMessage("the channel-binding flag is n, y or p="))
+    var authzid: ?Str = None
+    if fields[1] != ""
+        match value_of(fields[1], "a")
+            None    =>
+                return Err(ScramBadMessage("the authorization identity is a=<name>"))
+            Some(a) =>
+                authzid = Some(unescape_name(a)!)
+    let header = fields[0] + "," + fields[1] + ","
+    if str.starts_with(fields[2], "m=")
+        return Err(ScramMandatoryExtension)
+    let user = value_of(fields[2], "n") ?? ""
+    let nonce = value_of(fields[3], "r") ?? ""
+    if value_of(fields[2], "n") == None
+        return Err(ScramBadMessage("the user is n=<name>"))
+    if value_of(fields[3], "r") == None
+        return Err(ScramBadMessage("the nonce is r=<nonce>"))
+    let name = unescape_name(user)!
+    if str.len(name) == 0
+        return Err(ScramBadUsername)
+    if not printable_nonce(nonce)
+        return Err(ScramBadNonce)
+    Ok(ScramClientFirstParts { header: header, authzid: authzid, username: name, nonce: nonce,
+                               bare: str.slice(message, str.len(header), str.len(message)) })
+
+// The parts of a server-first message: the combined nonce, the salt as
+// bytes and the iteration count.
+pub struct ScramServerFirstParts
+    nonce: Str
+    salt: Bytes
+    iterations: Int
+
+// Read a server-first message.
+//
+// Refuses `ScramMandatoryExtension`, `ScramBadNonce`, `ScramBadSalt` and
+// `ScramBadMessage` for an iteration count that is not a positive number or
+// an attribute out of order.
+pub fn parse_server_first(message: Str) -> Result<ScramServerFirstParts, ScramError> []
+    let fields = str.split(message, ",")
+    if list.len(fields) < 3
+        return Err(ScramBadMessage("a server-first message has a nonce, a salt and an iteration count"))
+    if str.starts_with(fields[0], "m=")
+        return Err(ScramMandatoryExtension)
+    let nonce = value_of(fields[0], "r")
+    let salt64 = value_of(fields[1], "s")
+    let count = value_of(fields[2], "i")
+    if nonce == None or salt64 == None or count == None
+        return Err(ScramBadMessage("the fields are r=, s= and i= in that order"))
+    if not printable_nonce(nonce ?? "")
+        return Err(ScramBadNonce)
+    let salt = bytes.from_base64(salt64 ?? "") ?? bytes.zeros(0)
+    if bytes.len(salt) == 0
+        return Err(ScramBadSalt)
+    match scramcalc.positive_number(count ?? "")
+        None    => Err(ScramBadMessage("the iteration count is a positive number"))
+        Some(n) => Ok(ScramServerFirstParts { nonce: nonce ?? "", salt: salt, iterations: n })
+
+// The parts of a client-final message.
+//
+// `channel` is the `c=` value as sent, `without_proof` the message up to the
+// comma before `p=`, which the authentication message includes, and `proof`
+// the decoded proof.
+pub struct ScramClientFinalParts
+    channel: Str
+    nonce: Str
+    without_proof: Str
+    proof: Bytes
+
+// Read a client-final message.
+//
+// Refuses `ScramBadMessage` for fields out of order or a proof that is not
+// base64, and `ScramBadNonce`.
+pub fn parse_client_final(message: Str) -> Result<ScramClientFinalParts, ScramError> []
+    let fields = str.split(message, ",")
+    let n = list.len(fields)
+    if n < 3
+        return Err(ScramBadMessage("a client-final message has a channel binding, a nonce and a proof"))
+    let channel = value_of(fields[0], "c")
+    let nonce = value_of(fields[1], "r")
+    let proof64 = value_of(fields[n - 1], "p")
+    if channel == None or nonce == None or proof64 == None
+        return Err(ScramBadMessage("the fields are c=, r= ... p="))
+    if not printable_nonce(nonce ?? "")
+        return Err(ScramBadNonce)
+    let proof = bytes.from_base64(proof64 ?? "") ?? bytes.zeros(0)
+    if bytes.len(proof) == 0
+        return Err(ScramBadMessage("the proof is empty or not base64"))
+    Ok(ScramClientFinalParts { channel: channel ?? "", nonce: nonce ?? "",
+                               without_proof: str.join(list.slice(fields, 0, n - 1), ","), proof: proof })

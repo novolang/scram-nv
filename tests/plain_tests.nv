@@ -1,0 +1,63 @@
+// plain_tests.nv — SASL PLAIN, RFC 4616.
+//
+// The two messages are the examples of RFC 4616 section 4: the first
+// authenticates `tim` with no authorization identity, 21 bytes long as the
+// RFC says (`{21}`), and the second asks to act as `Ursel` while
+// authenticating as `Kurt`.
+
+use std.test
+use std.bytes
+use std.str
+use scramerr
+use scramcalc
+use saslplain
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn said<T>(r: Result<T, ScramError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+@test
+fn test_the_examples_of_rfc_4616_are_written_and_read() [io]
+    test.case("<NUL>tim<NUL>tanstaaftanstaaf")
+    let first = saslplain.plain_message(None, "tim", "tanstaaftanstaaf", ScramPrepStrict)!
+    test.assert_eq(bytes.len(first), 21)
+    test.assert_eq_str(bytes.to_hex(first), "0074696d0074616e737461616674616e7374616166")
+    test.case("Ursel<NUL>Kurt<NUL>xipj3plmq")
+    let second = saslplain.plain_message(Some("Ursel"), "Kurt", "xipj3plmq", ScramPrepStrict)!
+    test.assert_eq(bytes.len(second), 20)
+    let c = saslplain.plain_parse(second)!
+    test.assert_eq(c.authzid, Some("Ursel"))
+    test.assert_eq_str(c.authcid, "Kurt")
+    test.assert_eq_str(c.password, "xipj3plmq")
+    let d = saslplain.plain_parse(first)!
+    test.assert_eq(d.authzid, None)
+    test.assert_eq_str(d.authcid, "tim")
+    test.assert_eq_str(d.password, "tanstaaftanstaaf")
+
+@test
+fn test_a_plain_message_with_a_nul_or_an_empty_field_is_refused() [io]
+    let nul = str.from_byte(0)
+    test.assert_eq_str(said(saslplain.plain_message(None, "a${nul}b", "pw", ScramPrepStrict)),
+        "plain: malformed message: a field contains a NUL byte")
+    test.assert_eq_str(said(saslplain.plain_message(Some("z${nul}"), "a", "pw", ScramPrepVerbatim)),
+        "plain: malformed message: a field contains a NUL byte")
+    test.assert_eq_str(said(saslplain.plain_message(None, "a", "p${nul}w", ScramPrepVerbatim)),
+        "plain: malformed message: a field contains a NUL byte")
+    test.assert_eq_str(said(saslplain.plain_message(None, "", "pw", ScramPrepStrict)),
+        "plain: malformed message: the authentication identity is empty")
+    test.assert_eq_str(said(saslplain.plain_message(None, "a", "", ScramPrepStrict)),
+        "plain: malformed message: the password is empty")
+    test.assert_eq_str(said(saslplain.plain_message(None, "a", "p${str.from_byte(1)}", ScramPrepStrict)),
+        "scram: the password has a control character")
+    test.case("a reader wants exactly two NULs and two non-empty fields")
+    test.assert_eq_str(said(saslplain.plain_parse(h("6162"))),
+        "plain: malformed message: expected authzid NUL authcid NUL password")
+    test.assert_eq_str(said(saslplain.plain_parse(h("00610062000063"))),
+        "plain: malformed message: expected authzid NUL authcid NUL password")
+    test.assert_eq_str(said(saslplain.plain_parse(h("0000" + "62"))),
+        "plain: malformed message: the authentication identity is empty")
+    test.assert_eq_str(said(saslplain.plain_parse(h("006100"))), "plain: malformed message: the password is empty")

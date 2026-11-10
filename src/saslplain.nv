@@ -1,0 +1,85 @@
+// saslplain.nv — the SASL PLAIN mechanism, RFC 4616.
+//
+// PLAIN is one message from the client: an authorization identity, which
+// may be empty, a NUL byte, the authentication identity, a NUL byte and the
+// password.  It sends the password itself, so it belongs only inside a
+// protected channel such as TLS (RFC 4616 section 4), and it is here
+// because every consumer that runs SCRAM also meets servers that offer only
+// PLAIN.
+//
+// The three strings are UTF-8 and may not contain NUL.  The
+// authentication identity and the password may not be empty.  RFC 4616
+// asks for the strings to be prepared with SASLprep; the password is
+// prepared as `ScramPrep` says, and the identities are used as given.  A
+// reader does not check that the bytes are well-formed UTF-8.
+
+use std.bytes
+use std.str
+use std.list
+use scramerr
+use scramcalc
+
+// The three fields of a PLAIN message.
+pub struct PlainCredentials
+    authzid: ?Str
+    authcid: Str
+    password: Str
+
+fn has_nul(s: Str) -> Bool
+    str.contains(s, str.from_byte(0))
+
+// The client's PLAIN message: `[authzid] NUL authcid NUL password`.
+//
+// Refuses `PlainMalformed` for a NUL in any of the three, or an empty
+// `authcid` or `password`, and the refusals of `scramcalc.normalize`.
+//
+// ```novo
+// use std.bytes
+// use saslplain
+// use scramcalc
+//
+// fn main() [io]
+//     match saslplain.plain_message(None, "tim", "tanstaaftanstaaf", ScramPrepStrict)
+//         Ok(m)  => println("${bytes.len(m)}")   // 21
+//         Err(e) => println(e.message())
+// ```
+pub fn plain_message(authzid: ?Str, authcid: Str, password: Str,
+                     prep: ScramPrep) -> Result<Bytes, ScramError> []
+    let prepared = scramcalc.normalize(password, prep)!
+    let zid = authzid ?? ""
+    if has_nul(zid) or has_nul(authcid) or has_nul(password)
+        return Err(PlainMalformed("a field contains a NUL byte"))
+    if str.len(authcid) == 0
+        return Err(PlainMalformed("the authentication identity is empty"))
+    if bytes.len(prepared) == 0
+        return Err(PlainMalformed("the password is empty"))
+    Ok(bytes.concat([bytes.from_str(zid), bytes.u8(0), bytes.from_str(authcid), bytes.u8(0), prepared]))
+
+// A PLAIN message read into its fields, for a server.
+//
+// Refuses `PlainMalformed` for a message without exactly two NUL bytes and
+// for an empty authentication identity or password.  An empty
+// authorization identity is `None`.
+//
+// ```novo
+// use std.bytes
+// use saslplain
+//
+// fn main() [io]
+//     let wire = bytes.concat([bytes.zeros(1), bytes.from_str("tim"), bytes.zeros(1), bytes.from_str("secret")])
+//     match saslplain.plain_parse(wire)
+//         Ok(c)  => println(c.authcid)   // tim
+//         Err(e) => println(e.message())
+// ```
+pub fn plain_parse(message: Bytes) -> Result<PlainCredentials, ScramError> []
+    let parts = str.split(bytes.to_str(message), str.from_byte(0))
+    if list.len(parts) != 3
+        return Err(PlainMalformed("expected authzid NUL authcid NUL password"))
+    if str.len(parts[1]) == 0
+        return Err(PlainMalformed("the authentication identity is empty"))
+    if str.len(parts[2]) == 0
+        return Err(PlainMalformed("the password is empty"))
+    if str.len(parts[0]) == 0
+        Ok(PlainCredentials { authzid: None, authcid: parts[1], password: parts[2] })
+    else
+        Ok(PlainCredentials { authzid: Some(parts[0]), authcid: parts[1], password: parts[2] })

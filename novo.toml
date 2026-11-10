@@ -1,0 +1,19 @@
+[package]
+name        = "scram-nv"
+version     = "0.1.0"
+description = "SASL SCRAM-SHA-1 and SCRAM-SHA-256 (RFC 5802, RFC 7677) as two state machines the caller drives, the client and the server, with the nonce, the salted password, the proof and the signature, the attribute grammar and its escaping, the stored-key form a server keeps, and SASL PLAIN (RFC 4616).  Channel binding is not implemented and says so."
+license     = "Apache-2.0"
+stability   = "experimental"
+layer       = "core"
+category    = "crypto"
+tags        = ["scram", "sasl", "rfc-5802", "rfc-7677", "rfc-4616", "authentication", "password", "pbkdf2", "plain"]
+repository  = "https://github.com/novolang/scram-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+[docs.pages]
+"README.md" = "Logging in without sending the password"
+
+[dependencies]
+crypto-nv  = "^0.1.8"
+pbkdf2-nv  = "^0.1.0"

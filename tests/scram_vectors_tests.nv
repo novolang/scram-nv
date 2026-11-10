@@ -1,0 +1,222 @@
+// scram_vectors_tests.nv — complete SCRAM exchanges.
+//
+// The first two are the examples of RFC 5802 section 5 (SCRAM-SHA-1) and
+// RFC 7677 section 3 (SCRAM-SHA-256), cut out of the RFC text by
+// tests/generate/gen_scram_vectors.py.  The others are computed by the
+// reference in that script, RFC 5802 section 3 written out over Python's
+// hashlib, which reproduces the two RFC exchanges byte for byte before it is
+// used.  Nothing here was computed by this package.
+//
+// Each exchange is run from both ends.  The client makes the client-first
+// message, answers the server-first message with the client-final message
+// and accepts the server-final message.  The server reads the client-first
+// message, answers the server-first message from a credential made from the
+// password, accepts the client-final message and answers the server-final
+// message.  The credential's text form is compared as well.
+
+use std.test
+use std.bytes
+use scramcalc
+use scramclient
+use scramserver
+
+fn mech_named(name: Str) -> ScramMech
+    match scramcalc.mech_of_name(name)
+        Ok(m)  => m
+        Err(_) => ScramSha1
+
+fn text(b: Bytes) -> Str
+    bytes.to_str(b)
+
+fn wire(s: Str) -> Bytes
+    bytes.from_str(s)
+
+fn check_exchange(label: Str, mech_name: Str, user: Str, password: Str, cnonce: Str, snonce: Str,
+                  salt64: Str, iterations: Int, authzid: ?Str, c1: Str, s1: Str, c2: Str, s2: Str,
+                  stored_text: Str)
+    test.case(label)
+    let mech = mech_named(mech_name)
+    let salt = bytes.from_base64(salt64) ?? bytes.zeros(0)
+    let limits = ScramLimits { min_iterations: 1, max_iterations: 100000 }
+    test.case("${label}: the client")
+    match scramclient.client_first(mech, user, password, ScramPrepStrict, cnonce, authzid, limits)
+        Err(_)    => test.fail("client_first refused")
+        Ok(hello) =>
+            test.assert_eq_str(text(hello.message), c1)
+            match scramclient.client_final(hello.state, wire(s1))
+                Err(_)    => test.fail("client_final refused")
+                Ok(proof) =>
+                    test.assert_eq_str(text(proof.message), c2)
+                    match scramclient.client_finish(proof.state, wire(s2))
+                        Err(_) => test.fail("the server's signature was refused")
+                        Ok(_)  => test.assert_eq_str("done", "done")
+    test.case("${label}: the server")
+    match scramcalc.stored_from_password(mech, password, ScramPrepStrict, salt, iterations)
+        Err(_)     => test.fail("stored_from_password refused")
+        Ok(stored) =>
+            test.assert_eq_str(scramcalc.stored_to_text(stored), stored_text)
+            match scramserver.server_begin(wire(c1))
+                Err(_)    => test.fail("server_begin refused")
+                Ok(hello) =>
+                    test.assert_eq_str(hello.username, user)
+                    test.assert_eq(hello.authzid, authzid)
+                    match scramserver.server_challenge(hello.state, stored, snonce)
+                        Err(_)        => test.fail("server_challenge refused")
+                        Ok(challenge) =>
+                            test.assert_eq_str(text(challenge.message), s1)
+                            match scramserver.server_verify(challenge.state, wire(c2))
+                                Err(_)   => test.fail("the proof was refused")
+                                Ok(done) => test.assert_eq_str(text(done.message), s2)
+
+@test
+fn test_exchange_0() [io]
+    check_exchange("RFC 5802 section 5",
+        "SCRAM-SHA-1",
+        "user",
+        "pencil",
+        "fyko+d2lbbFgONRv9qkxdawL",
+        "3rfcNHYJY1ZVvWVs7j",
+        "QSXCR+Q6sek8bf92",
+        4096,
+        None,
+        "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL",
+        "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096",
+        "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=",
+        "v=rmF9pqV8S7suAoZWja4dJRkFsKQ=",
+        "SCRAM-SHA-1\$4096:QSXCR+Q6sek8bf92\$6dlGYMOdZcOPutkcNY8U2g7vK9Y=:D+CSWLOshSulAsxiupA+qs2/fTE=")
+
+@test
+fn test_exchange_1() [io]
+    check_exchange("RFC 7677 section 3",
+        "SCRAM-SHA-256",
+        "user",
+        "pencil",
+        "rOprNGfwEbeRWgbNEkqO",
+        "%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0",
+        "W22ZaJ0SNY7soEsUEjb6gQ==",
+        4096,
+        None,
+        "n,,n=user,r=rOprNGfwEbeRWgbNEkqO",
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF\$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+        "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
+        "SCRAM-SHA-256\$4096:W22ZaJ0SNY7soEsUEjb6gQ==\$WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=")
+
+@test
+fn test_exchange_2() [io]
+    check_exchange("SHA-256, 4096 iterations",
+        "SCRAM-SHA-256",
+        "alice",
+        "s3cr3t!",
+        "gHcLVQphJ0zsGh8lImS4p+Ci",
+        "fQE2WWVWm1Lz2hVktnqbt8GR",
+        "OspbyWL8Yl5vItz6lzgjjA==",
+        4096,
+        None,
+        "n,,n=alice,r=gHcLVQphJ0zsGh8lImS4p+Ci",
+        "r=gHcLVQphJ0zsGh8lImS4p+CifQE2WWVWm1Lz2hVktnqbt8GR,s=OspbyWL8Yl5vItz6lzgjjA==,i=4096",
+        "c=biws,r=gHcLVQphJ0zsGh8lImS4p+CifQE2WWVWm1Lz2hVktnqbt8GR,p=yJtmEb0rS8oKYWWcgCfzSNQlxuorT/nxooWac1kphQQ=",
+        "v=gZ2TupVrY7aJjPkmk1NcMlnJUw1AYx4N6FJU+bihJ9M=",
+        "SCRAM-SHA-256\$4096:OspbyWL8Yl5vItz6lzgjjA==\$pjECN4z1jGzHAcTg8tPMNSaZ2sAh6nnrt2U3DLS5ASM=:Gz3WbJkZeR/dEn8ANY6ue8AgAhiDxskSUJ+OR9aaHhs=")
+
+@test
+fn test_exchange_3() [io]
+    check_exchange("SHA-1, 4096 iterations",
+        "SCRAM-SHA-1",
+        "bob",
+        "correct horse battery staple",
+        "2I++MQwtJQPhO2sbVcZoi4ad",
+        "q6ihGLpVkgPkGoj7f8BE3wFU",
+        "qr3pfNoYvSLUaCezct+tVw==",
+        4096,
+        None,
+        "n,,n=bob,r=2I++MQwtJQPhO2sbVcZoi4ad",
+        "r=2I++MQwtJQPhO2sbVcZoi4adq6ihGLpVkgPkGoj7f8BE3wFU,s=qr3pfNoYvSLUaCezct+tVw==,i=4096",
+        "c=biws,r=2I++MQwtJQPhO2sbVcZoi4adq6ihGLpVkgPkGoj7f8BE3wFU,p=a7d0av1xLgLEmgzena6rNd05CCs=",
+        "v=GgliMWjyf8oVAmzkMmqLX1qdOaY=",
+        "SCRAM-SHA-1\$4096:qr3pfNoYvSLUaCezct+tVw==\$IGqx3zJBxmQJRfFTPgvgZBwR6Q8=:QSYSkxNOpjoj9bvw5JwovtJ7okQ=")
+
+@test
+fn test_exchange_4() [io]
+    check_exchange("SHA-256, a name with a comma and an equals sign",
+        "SCRAM-SHA-256",
+        "a,b=c",
+        "pw",
+        "mbYpLazDpDjj2Gf1zBTP57mC",
+        "haqURp+Bk49p6+EBkkzAqkvA",
+        "4+Llb77kl9FUCRuEEVLjQg==",
+        4096,
+        None,
+        "n,,n=a=2Cb=3Dc,r=mbYpLazDpDjj2Gf1zBTP57mC",
+        "r=mbYpLazDpDjj2Gf1zBTP57mChaqURp+Bk49p6+EBkkzAqkvA,s=4+Llb77kl9FUCRuEEVLjQg==,i=4096",
+        "c=biws,r=mbYpLazDpDjj2Gf1zBTP57mChaqURp+Bk49p6+EBkkzAqkvA,p=q1i0/2T8SYikpWcziBfH5P42ks2KtcHyoPjPG8l/n7c=",
+        "v=SNtvTMIOVZlE2ZPJ5FfE5W3OLQHAsDCE5hCrAHZRDFQ=",
+        "SCRAM-SHA-256\$4096:4+Llb77kl9FUCRuEEVLjQg==\$zgDOehjyfNW+/92SgSOMRw8wZBs3723NGuGibu0yBaQ=:PQb6VLglHsGgNgYtVL0WQeP8O0hTMfYiLiJhaQ9mIUk=")
+
+@test
+fn test_exchange_5() [io]
+    check_exchange("SHA-1, an authorization identity with a comma",
+        "SCRAM-SHA-1",
+        "user",
+        "pencil",
+        "oYTTXDStFC6/sRq3ENCTLORG",
+        "J1wvLNgacS/1f+3FTDqqDrLB",
+        "EU2Fyp3IaO5OzbMJF1TjCg==",
+        4096,
+        Some("admin,x=y"),
+        "n,a=admin=2Cx=3Dy,n=user,r=oYTTXDStFC6/sRq3ENCTLORG",
+        "r=oYTTXDStFC6/sRq3ENCTLORGJ1wvLNgacS/1f+3FTDqqDrLB,s=EU2Fyp3IaO5OzbMJF1TjCg==,i=4096",
+        "c=bixhPWFkbWluPTJDeD0zRHks,r=oYTTXDStFC6/sRq3ENCTLORGJ1wvLNgacS/1f+3FTDqqDrLB,p=QHJIAYTR4rUi2fx7owEjbZzRoZ8=",
+        "v=Ku6dETUK9uC4Ru7kVeWdYXjZSpg=",
+        "SCRAM-SHA-1\$4096:EU2Fyp3IaO5OzbMJF1TjCg==\$tHkCi5iWHEZKvF5IUQa2nLDYz04=:TR1LCR+tDocm87C7wFc6rP20R0M=")
+
+@test
+fn test_exchange_6() [io]
+    check_exchange("SHA-256, one iteration",
+        "SCRAM-SHA-256",
+        "u",
+        "p",
+        "C0NsjPnfSr8obVtHDiwL+TMv",
+        "K3Ov68v+dIYVVMhZkcbyyRbP",
+        "kumL50ceD47Besw8QTZMDg==",
+        1,
+        None,
+        "n,,n=u,r=C0NsjPnfSr8obVtHDiwL+TMv",
+        "r=C0NsjPnfSr8obVtHDiwL+TMvK3Ov68v+dIYVVMhZkcbyyRbP,s=kumL50ceD47Besw8QTZMDg==,i=1",
+        "c=biws,r=C0NsjPnfSr8obVtHDiwL+TMvK3Ov68v+dIYVVMhZkcbyyRbP,p=yjvRDXg7s0F5NspFSPBxhNJQSFd1K+DwWuX9ml0vMw4=",
+        "v=EhmxKcnPF5xqY8IJTWNKlk7rU2+CgeQ0agPghrK08F8=",
+        "SCRAM-SHA-256\$1:kumL50ceD47Besw8QTZMDg==\$sYXi0R9WRs4eAw4KFqOnELMmsv7NJa+InVK6YwD1/+I=:LZeDpd7JcTD0bxYBDUuf9rVy3rWCGM8qGZpAerypq6w=")
+
+@test
+fn test_exchange_7() [io]
+    check_exchange("SHA-256, 15000 iterations and a long password",
+        "SCRAM-SHA-256",
+        "carol",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "Lp8agqcV9wXPIeobCdLHL+5l",
+        "NJG5QyjH3WhFmvNdj7yXKUj6",
+        "uFOuic/ovFuWJ30n5vrbRQ==",
+        15000,
+        None,
+        "n,,n=carol,r=Lp8agqcV9wXPIeobCdLHL+5l",
+        "r=Lp8agqcV9wXPIeobCdLHL+5lNJG5QyjH3WhFmvNdj7yXKUj6,s=uFOuic/ovFuWJ30n5vrbRQ==,i=15000",
+        "c=biws,r=Lp8agqcV9wXPIeobCdLHL+5lNJG5QyjH3WhFmvNdj7yXKUj6,p=4xHuPr2woQrcQzn7o7Yik8CHFagVxcJd79TmNbN6kGs=",
+        "v=ES6vhr6UPh6oNKzMWWfp36uPzLFHBOukj3uIMse/OLQ=",
+        "SCRAM-SHA-256\$15000:uFOuic/ovFuWJ30n5vrbRQ==\$PZmuEkJ7ZZ29MlJExWQjAJvy+JAuDELoyzPKXY18FJY=:Tm2+UCVa2lqsdy8i/zXXiXvvWDUm9UXTlKge+2RxuLw=")
+
+@test
+fn test_exchange_8() [io]
+    check_exchange("SHA-1, an empty password",
+        "SCRAM-SHA-1",
+        "dave",
+        "",
+        "k9dG1w/rS76rJzhGCzVaFKVY",
+        "mYU4D9u+tIyv0CIsu9zPlpxZ",
+        "NXI6G5daLaQMjRVqNLqwSQ==",
+        4096,
+        None,
+        "n,,n=dave,r=k9dG1w/rS76rJzhGCzVaFKVY",
+        "r=k9dG1w/rS76rJzhGCzVaFKVYmYU4D9u+tIyv0CIsu9zPlpxZ,s=NXI6G5daLaQMjRVqNLqwSQ==,i=4096",
+        "c=biws,r=k9dG1w/rS76rJzhGCzVaFKVYmYU4D9u+tIyv0CIsu9zPlpxZ,p=OyEm0x7O+XFuu/mn84MF6ZdhvJE=",
+        "v=6CburpvWZOzqlBcIiQbeaL2EqPQ=",
+        "SCRAM-SHA-1\$4096:NXI6G5daLaQMjRVqNLqwSQ==\$ysGMI6YGLqXf6QtZw5DhAHqxLHA=:9mdbutWJS81GPISvOr7rbo8DiKE=")
